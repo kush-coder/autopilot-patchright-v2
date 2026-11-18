@@ -1,0 +1,534 @@
+import { type Project, SyntaxKind } from "ts-morph";
+import { assertDefined } from "./utils.ts";
+
+// -------------------------
+// server/chromium/crPage.ts
+// -------------------------
+export function patchCRPage(project: Project) {
+	// Add source file to the project
+	const crPageSourceFile = project.addSourceFileAtPath("packages/playwright-core/src/server/chromium/crPage.ts");
+	// Add the custom import and comment at the start of the file
+	crPageSourceFile.addImportDeclaration({
+		moduleSpecifier: "crypto",
+		defaultImport: "crypto",
+	});
+
+	// ------- CRPage Class -------
+	const crPageClass = crPageSourceFile.getClassOrThrow("CRPage");
+	crPageClass.addProperty({
+		name: "_reportAsNewPromise",
+		type: "Promise<void> | undefined",
+	});
+	crPageClass.addMethod({
+		name: "_reportAsNew",
+		returnType: "Promise<void>",
+		parameters: [{ name: "error", type: "Error", hasQuestionToken: true }],
+		statements: "return this._reportAsNewPromise ??= this._page.reportAsNew(this._opener?._page, error);",
+	});
+
+	// -- CRPage Constructor --
+	const crPageConstructor = assertDefined(
+		crPageClass.getConstructors().find(ctor => {
+			const params = ctor.getParameters();
+			return (
+				params[0]?.getName() === "client" &&
+				params[1]?.getName() === "targetId" &&
+				params[2]?.getName() === "browserContext" &&
+				params[3]?.getName() === "opener"
+			);
+		}),
+	);
+
+	// Sync request interception and create a unique init script tag.
+	const updateRequestInterceptionStatement = assertDefined(
+		crPageConstructor.getStatements().find(statement => statement.getText() === "this.updateRequestInterception();"),
+	);
+	updateRequestInterceptionStatement.replaceWithText(`
+		this.updateRequestInterception().catch(() => {});
+		this.initScriptTag = crypto.randomBytes(20).toString('hex');
+	`);
+	const initializePageStatement = assertDefined(
+		crPageConstructor
+			.getStatements()
+			.find(statement => statement.getText().includes("this._mainFrameSession._initialize")),
+	);
+	initializePageStatement.replaceWithText(
+		initializePageStatement
+			.getText()
+			.replace("this._page.reportAsNew(this._opener?._page, undefined)", "this._reportAsNew()")
+			.replace("this._page.reportAsNew(this._opener?._page, error)", "this._reportAsNew(error)"),
+	);
+
+	// -- exposeBinding Method --
+	crPageClass.addMethod({
+		name: "exposeBinding",
+		isAsync: true,
+		parameters: [{ name: "binding", type: "PageBinding" }],
+	});
+	const crExposeBindingMethod = crPageClass.getMethodOrThrow("exposeBinding");
+	// Initialize binding across all frame sessions and evaluate the binding source in all page frames
+	crExposeBindingMethod.setBodyText(`
+		if (binding.noGlobal)
+			return;
+		await this._forAllFrameSessions(frame => frame._initBinding(binding));
+		await Promise.all(this._page.frames().map(frame => frame.evaluateExpression(nullProgress, binding.source, { isFunction: false, world: 'main' }).catch(e => {})));
+	`);
+
+	// -- removeExposedBindings Method --
+	crPageClass.addMethod({
+		name: "removeExposedBindings",
+		isAsync: true,
+	});
+	const crRemoveExposedBindingsMethod = crPageClass.getMethodOrThrow("removeExposedBindings");
+	// Remove all exposed bindings from all frame sessions
+	crRemoveExposedBindingsMethod.setBodyText(`
+		await this._forAllFrameSessions(frame => frame._removeExposedBindings());
+	`);
+
+	// -- addInitScript Method --
+	const addInitScriptMethod = crPageClass.getMethodOrThrow("addInitScript");
+	// Insert a statement to push init scripts to the page's initScripts array for later evaluation
+	addInitScriptMethod
+		.getBodyOrThrow()
+		.asKindOrThrow(SyntaxKind.Block)
+		.insertStatements(0, "this._page.initScripts.push(initScript);");
+
+	// -- _sessionForFrame Method --
+	const sessionForFrameMethod = crPageClass.getMethodOrThrow("_sessionForFrame");
+	// Replace the error message for detached frames with a more concise version
+	const methodText = sessionForFrameMethod.getText();
+	sessionForFrameMethod.replaceWithText(methodText.replace("Frame has been detached.", "Frame was detached"));
+
+	// ------- FrameSession Class -------
+	const frameSessionClass = crPageSourceFile.getClassOrThrow("FrameSession");
+	// Add Properties to the Frame Class
+	frameSessionClass.addProperty({
+		name: "_exposedBindingNames",
+		type: "string[]",
+		initializer: "[]",
+	});
+	frameSessionClass.addProperty({
+		name: "_evaluateOnNewDocumentScripts",
+		type: "InitScript[]",
+		initializer: "[]",
+	});
+	frameSessionClass.addProperty({
+		name: "_parsedExecutionContextIds",
+		type: "number[]",
+		initializer: "[]",
+	});
+	frameSessionClass.addProperty({
+		name: "_exposedBindingScripts",
+		type: "string[]",
+		initializer: "[]",
+	});
+
+	// -- _initialize Method --
+	const initializeFrameSessionMethod = frameSessionClass.getMethodOrThrow("_initialize");
+	const initializeFrameSessionMethodBody = initializeFrameSessionMethod
+		.getBodyOrThrow()
+		.asKindOrThrow(SyntaxKind.Block);
+	initializeFrameSessionMethod.insertStatements(0, `
+		// Page.enable can immediately emit a dialog for a newly opened popup, so handle it before enabling.
+		let initializingDialogs = this._isMainFrame();
+		if (initializingDialogs)
+			this._eventListeners.push(eventsHelper.addEventListener(this._client, 'Page.javascriptDialogOpening', (event: any) => {
+				if (!initializingDialogs)
+					return;
+				this._firstNonInitialNavigationCommittedFulfill();
+				this._page.frameManager.createDummyMainFrameIfNeeded();
+				this._crPage._reportAsNew().then(() => this._onDialog(event));
+			}));
+		const pageEnablePromise = this._client.send('Page.enable');
+	`);
+
+	const promisesDeclaration = initializeFrameSessionMethod.getVariableDeclarationOrThrow("promises");
+	// An opener can block renderer setup while window.open() waits for the popup to resume.
+	const resumeTargetStatement = assertDefined(
+		initializeFrameSessionMethod
+			.getStatements()
+			.find(
+				statement => statement.getText() === "promises.push(this._client.send('Runtime.runIfWaitingForDebugger'));",
+			),
+	);
+	initializeFrameSessionMethod.insertStatements(
+		resumeTargetStatement.getChildIndex(),
+		`
+		if (this._isMainFrame() && !this._crPage._opener)
+			await Promise.all(promises);
+	`,
+	);
+	// Find the initializer array
+	const promisesInitializer = promisesDeclaration.getInitializerIfKindOrThrow(SyntaxKind.ArrayLiteralExpression);
+	// Find the relevant element inside the array that we need to update
+	promisesInitializer
+		.getElements()
+		.filter(
+			element =>
+				element.getText().includes("this._client.send('Runtime.enable'") ||
+				element.getText().includes("this._client.send('Runtime.addBinding', { name: PageBinding.kPlaywrightBinding })"),
+		)
+		.forEach(element => {
+			promisesInitializer.removeElement(element);
+		});
+	// Replace Page.enable send in promises with the early-started promise
+	promisesInitializer
+		.getElements()
+		.filter(element => element.getText().trim() === "this._client.send('Page.enable')")
+		.forEach(element => {
+			element.replaceWithText("pageEnablePromise");
+		});
+
+	// Find the relevant element inside the array that we need to update
+	const pageGetFrameTreeElement = assertDefined(
+		promisesInitializer
+			.getElements()
+			.find(element => element.getText().startsWith("this._client.send('Page.getFrameTree'")),
+	);
+	const pageGetFrameTreeThenBlock = pageGetFrameTreeElement
+		.asKindOrThrow(SyntaxKind.CallExpression)
+		.getFirstDescendantByKindOrThrow(SyntaxKind.ArrowFunction)
+		.getBody()
+		.asKindOrThrow(SyntaxKind.Block);
+	// Stop the early dialog listener after _addRendererListeners().
+	const addRendererListenersStatement = assertDefined(
+		pageGetFrameTreeThenBlock
+			.getStatements()
+			.find(statement => statement.getText() === "this._addRendererListeners();"),
+	);
+	pageGetFrameTreeThenBlock.insertStatements(
+		addRendererListenersStatement.getChildIndex() + 1,
+		"initializingDialogs = false;",
+	);
+	// Remove eager isolated world creation while preserving upstream's local frame collection.
+	pageGetFrameTreeThenBlock
+		.getStatements()
+		.filter(statement => statement.getText().includes("this._client._sendMayFail('Page.createIsolatedWorld', {"))
+		.forEach(statement => {
+			statement.remove();
+		});
+	// Find the non-initial navigation branch and ensure our localFrames setup is present.
+	const lifecycleEventIfStatement = assertDefined(
+		initializeFrameSessionMethodBody
+			.getDescendantsOfKind(SyntaxKind.IfStatement)
+			.find(statement => statement.getText().startsWith("if (isInitialEmptyPage)")),
+	);
+	const lifecycleEventElseBlock = assertDefined(lifecycleEventIfStatement.getElseStatement());
+	lifecycleEventElseBlock.asKindOrThrow(SyntaxKind.Block).insertStatements(0, `
+			for (const frame of localFrames) {
+				this._page.frameManager.frame(frame._id)._context("utility").catch(() => {});
+				for (const binding of this._crPage._browserContext._pageBindings.values())
+					frame.evaluateExpression(nullProgress, binding.source, { isFunction: false, world: 'main' }).catch(e => {});
+			}
+		`);
+
+	// Allow focus control on pages https://github.com/Kaliiiiiiiiii-Vinyzu/patchright/issues/137#event-20580557051
+	const focusEmulationIfStatement = assertDefined(
+		initializeFrameSessionMethodBody
+			.getDescendantsOfKind(SyntaxKind.IfStatement)
+			.find(
+				statement =>
+					statement.getText().startsWith("if (this._isMainFrame()") &&
+					statement.getText().includes("Emulation.setFocusEmulationEnabled"),
+			),
+	);
+	focusEmulationIfStatement.replaceWithText(`
+		if (this._isMainFrame() && !this._crPage._browserContext._options.focusControl)
+			promises.push(this._client.send("Emulation.setFocusEmulationEnabled", { enabled: true }));
+	`);
+	// Install binding wrappers before dependent init scripts.
+	const initScriptLoop = assertDefined(
+		initializeFrameSessionMethodBody
+			.getDescendantsOfKind(SyntaxKind.ForOfStatement)
+			.find(statement => statement.getText().includes("this._crPage._page.allInitScripts()")),
+	);
+	initScriptLoop.replaceWithText(`
+		promises.push(Promise.all(this._crPage._page.allBindings().map(binding => this._initBinding(binding))).then(() =>
+			Promise.all([...this._crPage._browserContext.initScripts, ...this._crPage._page.initScripts]
+				.map(initScript => this._evaluateOnNewDocument(initScript, 'main', true)))
+		));
+	`);
+
+	// A dialog can block the first navigation from committing, so allow the initialized page to be reported and handled.
+	frameSessionClass.getMethodOrThrow("_onDialog").insertStatements(0, `
+		if (this._isMainFrame() && !this._page.initializedOrUndefined())
+			this._firstNonInitialNavigationCommittedFulfill();
+	`);
+	const onDialogMethod = frameSessionClass.getMethodOrThrow("_onDialog");
+	const missingDialogFrameStatement = assertDefined(
+		onDialogMethod
+			.getStatements()
+			.find(statement => statement.getText().includes("!this._page.frameManager.frame(this._targetId)")),
+	);
+	missingDialogFrameStatement.replaceWithText(
+		missingDialogFrameStatement
+			.getText()
+			.replace(
+				"!this._page.frameManager.frame(this._targetId)",
+				"!this._page.frameManager.frame(this._targetId) && !this._isMainFrame()",
+			),
+	);
+
+	// -- _initBinding Method --
+	frameSessionClass.addMethod({
+		name: "_initBinding",
+		isAsync: true,
+		parameters: [
+			{
+				name: "binding",
+				initializer: "PageBinding",
+			},
+		],
+	});
+	const initBindingMethod = frameSessionClass.getMethodOrThrow("_initBinding");
+	initBindingMethod.setBodyText(`
+		if (binding.noGlobal)
+			return;
+		// Remember this binding so future execution contexts get it in _onExecutionContextCreated.
+		this._exposedBindingNames.push(binding.name);
+		this._exposedBindingScripts.push(binding.source);
+
+		// Install binding in all existing execution contexts.
+		const contextIds = Array.from(this._contextIdToContext.keys());
+		await Promise.all([
+			this._client._sendMayFail('Runtime.addBinding', { name: binding.name }),
+			...contextIds.map(executionContextId => this._client._sendMayFail('Runtime.addBinding', { name: binding.name, executionContextId })),
+		]);
+
+		// Install the wrapper before later init scripts and in all existing contexts.
+		await this._evaluateOnNewDocument(binding.initScript, 'main', true);
+	`);
+
+	// -- _removeExposedBindings Method --
+	frameSessionClass.addMethod({
+		name: "_removeExposedBindings",
+		isAsync: true,
+	});
+	const fsRemoveExposedBindingsMethod = frameSessionClass.getMethodOrThrow("_removeExposedBindings");
+	fsRemoveExposedBindingsMethod.setBodyText(`
+		const toRetain: string[] = [];
+		const toRemove: string[] = [];
+		for (const name of this._exposedBindingNames)
+			(name.startsWith('__pw_') ? toRetain : toRemove).push(name);
+		this._exposedBindingNames = toRetain;
+		await Promise.all(toRemove.map(name => this._client.send('Runtime.removeBinding', { name })));
+	`);
+
+	// -- _onLifecycleEvent Method --
+	const onLifecycleEventMethod = frameSessionClass.getMethodOrThrow("_onLifecycleEvent");
+	onLifecycleEventMethod.setIsAsync(true);
+	onLifecycleEventMethod.addStatements(`
+		// Only do full init script cleanup on load to reduce CDP round-trip pressure.
+		if (event.name !== "load")
+		  return;
+		var document = await this._client._sendMayFail("DOM.getDocument");
+		if (!document) return
+		var query = await this._client._sendMayFail("DOM.querySelectorAll", {
+		  nodeId: document.root.nodeId,
+		  selector: "[class=" + this._crPage.initScriptTag + "]"
+		});
+		if (!query) return
+		for (const nodeId of query.nodeIds) await this._client._sendMayFail("DOM.removeNode", { nodeId: nodeId });
+		// ensuring execution context
+		try { await this._page.frameManager.frame(this._targetId)._context("utility") } catch { };
+	`);
+
+	// -- _eventBelongsToStaleFrame Method --
+	const eventBelongsToStaleFrameMethod = frameSessionClass.getMethodOrThrow("_eventBelongsToStaleFrame");
+	eventBelongsToStaleFrameMethod.setBodyText(`
+		const frame = this._page.frameManager.frame(frameId);
+		if (!frame)
+			return true;
+		let session: FrameSession;
+		try {
+			session = this._crPage._sessionForFrame(frame);
+		} catch {
+			return true;
+		}
+		return session && session !== this && !session._swappedIn;
+	`);
+
+	// -- _onFrameNavigated Method --´
+	const onFrameNavigatedMethod = frameSessionClass.getMethodOrThrow("_onFrameNavigated");
+	onFrameNavigatedMethod.setIsAsync(true);
+	onFrameNavigatedMethod.addStatements(`
+		const functionBindings = this._page.allBindings().filter(binding => binding.noGlobal);
+		if (this._page.allBindings().length) {
+			try {
+				const context = await this._page.frameManager.frame(framePayload.id)._context('main');
+				for (const binding of functionBindings)
+					binding.dispatchFunction(this._page, context).catch(() => {});
+			} catch { }
+		}
+		// patchright: For non-initial navigations, skip DOM cleanup since the document just changed
+		// and init script tags haven't been re-added yet. The _onLifecycleEvent("load") handler
+		// will perform cleanup after the page finishes loading.
+		if (!initial) {
+			try { await this._page.frameManager.frame(this._targetId)._context("utility") } catch { };
+			return;
+		}
+		var document = await this._client._sendMayFail("DOM.getDocument");
+		if (!document) return
+		var query = await this._client._sendMayFail("DOM.querySelectorAll", {
+			nodeId: document.root.nodeId,
+			selector: "[class=" + this._crPage.initScriptTag + "]"
+		});
+		if (!query) return
+		for (const nodeId of query.nodeIds) await this._client._sendMayFail("DOM.removeNode", { nodeId: nodeId });
+		// ensuring execution context
+		try { await this._page.frameManager.frame(this._targetId)._context("utility") } catch { };
+	`);
+
+	// -- _onExecutionContextCreated Method --
+	const onExecutionContextCreatedMethod = frameSessionClass.getMethodOrThrow("_onExecutionContextCreated");
+	onExecutionContextCreatedMethod.insertStatements(0, `
+		for (const name of this._exposedBindingNames)
+			this._client._sendMayFail('Runtime.addBinding', { name: name, executionContextId: contextPayload.id });
+	`);
+	onExecutionContextCreatedMethod.insertStatements(
+		2,
+		`
+		if (contextPayload.auxData?.type === "worker") throw new Error("ExecutionContext is worker");
+	`,
+	);
+	// Replace the legacy worldName branching logic with a direct assignment from contextPayload.name.
+	onExecutionContextCreatedMethod
+		.getStatements()
+		.filter(
+			statement =>
+				statement.getText().includes("let worldName: types.World|null") ||
+				statement.getText().includes("if (contextPayload.auxData && !!contextPayload.auxData.isDefault)") ||
+				statement.getText().includes("worldName = 'main'") ||
+				statement.getText().includes("else if (contextPayload.name === this._crPage.utilityWorldName)") ||
+				statement.getText().includes("worldName = 'utility'"),
+		)
+		.forEach((statement, index) => {
+			if (index === 0) statement.replaceWithText("let worldName = contextPayload.name;");
+			else statement.remove();
+		});
+	// Guard _contextCreated to only register known worlds ('main' or 'utility')
+	const contextCreatedIfStatement = assertDefined(
+		onExecutionContextCreatedMethod
+			.getDescendantsOfKind(SyntaxKind.IfStatement)
+			.find(stmt => stmt.getText().includes("if (worldName)") && stmt.getText().includes("contextCreated")),
+	);
+	contextCreatedIfStatement.replaceWithText(`
+		if (worldName && (worldName === 'main' || worldName === 'utility'))
+			frame.contextCreated(worldName, context);
+	`);
+	// Execute all exposed binding scripts in the created execution context
+	onExecutionContextCreatedMethod.addStatements(`
+		for (const source of this._exposedBindingScripts) {
+			this._client._sendMayFail("Runtime.evaluate", {
+				expression: source,
+				contextId: contextPayload.id,
+				awaitPromise: true,
+			})
+		}
+	`);
+
+	// -- _onAttachedToTarget Method --
+	const onAttachedToTargetMethod = frameSessionClass.getMethodOrThrow("_onAttachedToTarget");
+	onAttachedToTargetMethod.setIsAsync(true);
+	// Intercept the Runtime.executionContextCreated event to create execution contexts and extract globalThis objectId
+	const sessionOnceCall = assertDefined(
+		onAttachedToTargetMethod
+			.getDescendantsOfKind(SyntaxKind.ExpressionStatement)
+			.find(statement => statement.getText().includes("session.once('Runtime.executionContextCreated'")),
+	);
+	sessionOnceCall.getParentIfKindOrThrow(SyntaxKind.Block).insertStatements(
+		sessionOnceCall.getChildIndex() + 1,
+		`
+			var globalThis = await session._sendMayFail('Runtime.evaluate', {
+				expression: "globalThis",
+				serializationOptions: { serialization: "idOnly" }
+			});
+			if (globalThis && globalThis.result && globalThis.result.objectId) {
+				var globalThisObjId = globalThis.result.objectId;
+				var executionContextId = parseInt(globalThisObjId.split('.')[1], 10);
+				if (!isNaN(executionContextId)) {
+					worker.createExecutionContext(new CRExecutionContext(session, { id: executionContextId }));
+				}
+			}
+		`,
+	);
+
+	// Remove `Runtime.enable` calls
+	const runtimeStatementToRemove = assertDefined(
+		onAttachedToTargetMethod
+			.getStatements()
+			.find(statement => statement.getText().includes("session._sendMayFail('Runtime.enable');")),
+	);
+	runtimeStatementToRemove.remove();
+
+	// -- _onBindingCalled Method --
+	const onBindingCalledMethod = frameSessionClass.getMethodOrThrow("_onBindingCalled");
+	// Fall back to the main frame context when no context is available for binding callbacks.
+	const onBindingCalledIfStatement = assertDefined(
+		onBindingCalledMethod
+			.getDescendantsOfKind(SyntaxKind.IfStatement)
+			.find(
+				statement =>
+					statement.getExpression().getText() === "context" &&
+					statement.getText().includes("await this._page.onBindingCalled(event.payload, context)"),
+			),
+	);
+	onBindingCalledIfStatement.replaceWithText(`
+		if (context) {
+			await this._page.onBindingCalled(event.payload, context);
+		} else {
+			// Ensure execution contexts for all frames are resolved/created
+			await Promise.all(this._page.frames().map(frame => frame.mainContext().catch(() => null)));
+			const fallbackContext = this._contextIdToContext.get(event.executionContextId);
+			if (fallbackContext) {
+				await this._page.onBindingCalled(event.payload, fallbackContext);
+			} else {
+				// Last resort fallback
+				const mainCtx = await this._page.mainFrame().mainContext().catch(() => null);
+				if (mainCtx) {
+					await this._page.onBindingCalled(event.payload, mainCtx);
+				}
+			}
+		}
+	`);
+
+	// -- _evaluateOnNewDocument Method --
+	frameSessionClass.getMethodOrThrow("_evaluateOnNewDocument").setBodyText(`
+			const worldName = world === 'utility' ? this._crPage.utilityWorldName : undefined;
+			const { identifier } = await this._client.send('Page.addScriptToEvaluateOnNewDocument', { source: initScript.source, worldName, runImmediately });
+			this._initScriptIds.set(initScript, identifier);
+		`);
+
+	// -- _removeEvaluatesOnNewDocument Method --
+	frameSessionClass.getMethodOrThrow("_removeEvaluatesOnNewDocument").setBodyText(`
+			const toRemove = new Set(initScripts);
+			this._evaluateOnNewDocumentScripts = this._evaluateOnNewDocumentScripts.filter(script => !toRemove.has(script));
+			const ids: string[] = [];
+			for (const script of initScripts) {
+				const id = this._initScriptIds.get(script);
+				if (id)
+					ids.push(id);
+				this._initScriptIds.delete(script);
+			}
+			await Promise.all(ids.map(identifier => this._client.send('Page.removeScriptToEvaluateOnNewDocument', { identifier }).catch(() => {})));
+		`);
+
+	// -- _adoptBackendNodeId Method --
+	const adoptBackendNodeIdMethod = frameSessionClass.getMethodOrThrow("_adoptBackendNodeId");
+	// Simplify the executionContextId lookup by accessing the delegate directly instead of casting through any.
+	const resolveNodeResultStatement = assertDefined(
+		adoptBackendNodeIdMethod
+			.getVariableStatements()
+			.find(
+				statement =>
+					statement.getText().includes("const result = await this._client._sendMayFail('DOM.resolveNode'") &&
+					statement.getText().includes("executionContextId: (to.delegate as CRExecutionContext)._contextId"),
+			),
+	);
+	const executionContextIdAssignment = assertDefined(
+		resolveNodeResultStatement
+			.getDescendantsOfKind(SyntaxKind.PropertyAssignment)
+			.find(assignment => assignment.getName() === "executionContextId"),
+	);
+	executionContextIdAssignment.setInitializer("to.delegate._contextId");
+}

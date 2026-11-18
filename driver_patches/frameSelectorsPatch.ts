@@ -1,0 +1,428 @@
+import { type Project, SyntaxKind } from "ts-morph";
+import { assertDefined } from "./utils.ts";
+
+// ------------------------
+// server/frameSelectors.ts
+// ------------------------
+export function patchFrameSelectors(project: Project) {
+	// Add source file to the project
+	const frameSelectorsSourceFile = project.addSourceFileAtPath("packages/playwright-core/src/server/frameSelectors.ts");
+	// Add the custom import and comment at the start of the file
+	frameSelectorsSourceFile.addImportDeclaration({
+		moduleSpecifier: "./dom",
+		namedImports: ["ElementHandle"],
+	});
+	frameSelectorsSourceFile.addImportDeclaration({
+		moduleSpecifier: "./chromium/crConnection",
+		namedImports: ["CRSession"],
+		isTypeOnly: true,
+	});
+	frameSelectorsSourceFile.addImportDeclaration({
+		moduleSpecifier: "./progress",
+		namedImports: ["Progress", "nullProgress"],
+	});
+	frameSelectorsSourceFile.addImportDeclaration({
+		moduleSpecifier: "./chromium/protocol",
+		namedImports: ["Protocol"],
+		isTypeOnly: true,
+	});
+
+	// ------- FrameSelectors Class -------
+	const frameSelectorsClass = frameSelectorsSourceFile.getClassOrThrow("FrameSelectors");
+
+	// -- _hasClosedShadowRoots Method --
+	frameSelectorsClass.addMethod({ name: "_hasClosedShadowRoots", isAsync: true });
+	frameSelectorsClass.getMethodOrThrow("_hasClosedShadowRoots").setBodyText(`
+		const client = this.frame._page.delegate._sessionForFrame(this.frame)._client;
+		const { root } = await client.send("DOM.getDocument", { depth: -1, pierce: true });
+		const nodes = [root];
+		while (nodes.length) {
+			const node = nodes.pop()!;
+			if (node.shadowRoots?.some(root => root.shadowRootType === "closed"))
+				return true;
+			nodes.push(...node.children || [], ...node.shadowRoots || []);
+			if (node.contentDocument)
+				nodes.push(node.contentDocument);
+		}
+		return false;
+	`);
+
+	// Keep upstream's multi-frame resolution and handle/value semantics for closed shadow roots.
+	const callOnSelectorInternalMethod = frameSelectorsClass.getMethodOrThrow("_callOnSelectorInternal");
+	const getResultDeclaration = assertDefined(
+		callOnSelectorInternalMethod
+			.getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+			.find(d => d.getName() === "getResult"),
+	);
+	const getResultFunction = getResultDeclaration.getInitializerIfKindOrThrow(SyntaxKind.ArrowFunction);
+	const elementsDeclaration = assertDefined(
+		getResultFunction
+			.getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+			.find(
+				d =>
+					d.getName() === "elements" &&
+					d.getInitializerIfKind(SyntaxKind.CallExpression)?.getExpression().getText() === "injected.querySelectorAll",
+			),
+	);
+	elementsDeclaration.setInitializer(`params.elements || ${elementsDeclaration.getInitializerOrThrow().getText()}`);
+	const evaluationParams = assertDefined(
+		getResultFunction
+			.getDescendantsOfKind(SyntaxKind.ObjectLiteralExpression)
+			.find(o => o.getProperty("functionText") && o.getProperty("returnByValue")),
+	);
+	evaluationParams.addShorthandPropertyAssignment({ name: "elements" });
+	const getResultBody = getResultFunction
+		.getBody()
+		.asKindOrThrow(SyntaxKind.Block)
+		.getStatements()
+		.map(s => s.getText())
+		.join("\n");
+	getResultFunction.setBodyText(`
+		const elements = !scope && await frame.selectors._hasClosedShadowRoots()
+			? await frame.querySelectorAll(nullProgress, stringifySelector(info.parsed)) : undefined;
+		try {
+			${getResultBody}
+		} finally {
+			for (const element of elements || [])
+				element.dispose();
+		}
+	`);
+
+	// -- queryArrayInMainWorld Method --
+	const queryArrayInMainWorldMethod = frameSelectorsClass.getMethodOrThrow("queryArrayInMainWorld");
+	if (!queryArrayInMainWorldMethod.getParameter("isolatedContext"))
+		queryArrayInMainWorldMethod.addParameter({
+			name: "isolatedContext",
+			type: "boolean",
+			hasQuestionToken: true,
+		});
+	// Update mainWorld property based on isolatedContext parameter
+	const resolveInjectedCall = queryArrayInMainWorldMethod
+		.getDescendantsOfKind(SyntaxKind.CallExpression)
+		.find(
+			callExpr =>
+				callExpr.getExpression().getText() === "this.callOnSelectorHandle" &&
+				callExpr.getArguments()[0]?.getKind() === SyntaxKind.ObjectLiteralExpression,
+		);
+	const mainWorldProp = assertDefined(
+		assertDefined(resolveInjectedCall)
+			.getArguments()[0]
+			.asKindOrThrow(SyntaxKind.ObjectLiteralExpression)
+			.getProperty("mainWorld"),
+	);
+	if (mainWorldProp.getText() === "mainWorld: true") mainWorldProp.replaceWithText("mainWorld: !isolatedContext");
+	assertDefined(
+		queryArrayInMainWorldMethod
+			.getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+			.find(d => d.getName() === "context"),
+	).setInitializer("await this.frame.context(isolatedContext ? 'utility' : 'main')");
+
+	// Keep upstream's iframe visibility and validation when querying closed shadow roots.
+	const queryFramesMethod = frameSelectorsClass.getMethodOrThrow("_queryFrames");
+	const queryDeclaration = assertDefined(
+		queryFramesMethod.getDescendantsOfKind(SyntaxKind.VariableDeclaration).find(d => d.getName() === "query"),
+	);
+	const queryFunction = queryDeclaration.getInitializerIfKindOrThrow(SyntaxKind.ArrowFunction);
+	const queryCall = assertDefined(
+		queryFunction
+			.getDescendantsOfKind(SyntaxKind.CallExpression)
+			.find(call => call.getExpression().getText() === "injected.evaluateHandle"),
+	);
+	const queryCallback = queryCall.getArguments()[0].asKindOrThrow(SyntaxKind.ArrowFunction);
+	queryCallback.getParameters()[1].replaceWithText("{ info, scope, selectorString, elements: matches }");
+	const queriedElements = assertDefined(
+		queryCallback.getDescendantsOfKind(SyntaxKind.VariableDeclaration).find(d => d.getName() === "elements"),
+	);
+	queriedElements.setInitializer(`matches || ${queriedElements.getInitializerOrThrow().getText()}`);
+	queryCall.getArguments()[1].asKindOrThrow(SyntaxKind.ObjectLiteralExpression).addShorthandPropertyAssignment({
+		name: "elements",
+	});
+	const queryBody = queryFunction
+		.getBody()
+		.asKindOrThrow(SyntaxKind.Block)
+		.getStatements()
+		.map(s => s.getText())
+		.join("\n");
+	queryFunction.setBodyText(`
+		const elements = await frame.selectors._hasClosedShadowRoots()
+			? await frame.querySelectorAll(nullProgress, stringifySelector(info.parsed), scope) : undefined;
+		try {
+			${queryBody}
+		} finally {
+			for (const element of elements || [])
+				element.dispose();
+		}
+	`);
+	const contentFrameDeclaration = assertDefined(
+		queryFunction.getDescendantsOfKind(SyntaxKind.VariableDeclaration).find(d => d.getName() === "contentFrame"),
+	);
+	contentFrameDeclaration.setInitializer(`handle && await handle.evaluateInUtility(([injected, node]) => node.isConnected, {}).catch(() => false)
+		? await frame._page.delegate.getContentFrame(handle) : null`);
+
+	// Lazy contexts must be created even when searching multiple frames, without waiting on stalled frames.
+	for (const method of [queryFramesMethod, callOnSelectorInternalMethod]) {
+		const contextDeclaration = assertDefined(
+			method.getDescendantsOfKind(SyntaxKind.VariableDeclaration).find(d => d.getName() === "context"),
+		);
+		const world = method === queryFramesMethod ? "info.world" : "world";
+		contextDeclaration.setInitializer(`noStall ? await frame.raceAgainstEvaluationStallingEvents(() => frame.context(${world})).catch(e => {
+			if (e instanceof EvaluationStalledError)
+				return null;
+			throw e;
+		}) : await frame.context(${world})`);
+	}
+
+	// Resolve a single matching frame for Patchright's custom selector operations.
+	frameSelectorsClass.addMethod({
+		name: "resolveInjectedForSelector",
+		isAsync: true,
+		parameters: [{ name: "target", type: "types.SelectorTarget & { mainWorld?: boolean }" }],
+		statements: `
+			const frames = await this.resolveFramesForSelector(target);
+			let result: { frame: Frame, info: SelectorInfo, injected: JSHandle<InjectedScript>, frameVisible: boolean, scope?: ElementHandle } | null = null;
+			for (const resolved of frames) {
+				const getMatch = async () => {
+					const context = await resolved.frame.context(target.mainWorld ? 'main' : resolved.info.world);
+					const injected = await context.injectedScript();
+					if (frames.length > 1) {
+						let count = await injected.evaluate((injected, { info, scope }) => injected.querySelectorAll(info.parsed, scope || document).length, { info: resolved.info, scope: resolved.scope });
+						if (!count && !resolved.scope) {
+							const elements = await resolved.frame.querySelectorAll(nullProgress, stringifySelector(resolved.info.parsed));
+							count = elements.length;
+							for (const element of elements)
+								element.dispose();
+						}
+						if (!count)
+							return null;
+					}
+					return { ...resolved, injected };
+				};
+				const match = frames.length > 1 ? await resolved.frame.raceAgainstEvaluationStallingEvents(getMatch).catch(e => {
+					if (e instanceof EvaluationStalledError)
+						return null;
+					throw e;
+				}) : await getMatch();
+				if (!match)
+					continue;
+				if (result)
+					throw new NonRecoverableDOMError('frameLocator() matched elements in multiple frames.');
+				result = match;
+			}
+			return result;
+		`,
+	});
+
+	// -- _customFindFramesByParsed Method -- progress
+	if (!frameSelectorsClass.getMethod("_customFindFramesByParsed"))
+		frameSelectorsClass.addMethod({
+			name: "_customFindFramesByParsed",
+			isAsync: true,
+			parameters: [
+				{ name: "resolved", type: "JSHandle<InjectedScript>" },
+				{ name: "client", type: "CRSession" },
+				{ name: "context", type: "FrameExecutionContext" },
+				{ name: "documentScope", type: "ElementHandle" },
+				{ name: "progress", type: "Progress | undefined" },
+				{ name: "parsed", type: "ParsedSelector" },
+			],
+		});
+	const customFindFramesByParsedSelectorsMethod = frameSelectorsClass.getMethodOrThrow("_customFindFramesByParsed");
+	customFindFramesByParsedSelectorsMethod.setBodyText(`
+		var parsedEdits = { ...parsed };
+		const callId = progress?.metadata.id;
+		progress = progress || nullProgress;
+		// Note: We start scoping at document level
+		var currentScopingElements = [documentScope];
+
+		for (const part of [...parsed.parts]) {
+			parsedEdits.parts = [part];
+			var elements = [];
+
+			if (part.name === "nth") {
+				const partNth = Number(part.body);
+				// Check if any Elements are currently scoped, else return empty array to continue polling
+				if (currentScopingElements.length == 0)
+					return [];
+
+				if (partNth > currentScopingElements.length-1 || partNth < -(currentScopingElements.length-1)) {
+					if (parsed.capture !== undefined)
+						throw new Error("Can't query n-th element in a request with the capture.");
+					return [];
+				}
+				currentScopingElements = [currentScopingElements.at(partNth)];
+				continue;
+			} else if (part.name === "internal:or") {
+				var orredElements = await this._customFindFramesByParsed(resolved, client, context, documentScope, progress, part.body.parsed);
+				elements = [...currentScopingElements, ...orredElements];
+			} else if (part.name == "internal:and") {
+				var andedElements = await this._customFindFramesByParsed(resolved, client, context, documentScope, progress, part.body.parsed);
+				const backendNodeIds = new Set(andedElements.map(elem => elem.backendNodeId));
+				elements = currentScopingElements.filter(elem => backendNodeIds.has(elem.backendNodeId));
+			} else {
+				for (const scope of currentScopingElements) {
+					const describedScope = await client.send("DOM.describeNode", {
+						objectId: scope._objectId,
+						depth: -1,
+						pierce: true
+					});
+
+					let findClosedShadowRoots = function(node, results = []) {
+						if (!node || typeof node !== "object") return results;
+						if (node.shadowRoots && Array.isArray(node.shadowRoots)) {
+							for (const shadowRoot of node.shadowRoots) {
+								if (shadowRoot.shadowRootType === "closed" && shadowRoot.backendNodeId) {
+									results.push(shadowRoot.backendNodeId);
+								}
+								findClosedShadowRoots(shadowRoot, results);
+							}
+						}
+						if (node.nodeName !== "IFRAME" && node.children && Array.isArray(node.children)) {
+							for (const child of node.children) {
+								findClosedShadowRoots(child, results);
+							}
+						}
+						return results;
+					};
+					var shadowRootBackendIds = findClosedShadowRoots(describedScope.node);
+
+					const shadowRoots = await Promise.all(
+						shadowRootBackendIds.map(async backendNodeId => {
+							const resolved = await client.send("DOM.resolveNode", {
+								backendNodeId,
+								contextId: context.delegate._contextId,
+							});
+							return new ElementHandle(context, resolved.object.objectId);
+						})
+					);
+
+					// Elements Queryed in the "current round"
+					const queryGroups: { handles: any; parentNode: any }[] = [];
+					for (var shadowRoot of shadowRoots) {
+						const shadowHandles = await (shadowRoot as any)._evaluateHandleInUtility(
+							([injected, node, { parsed, callId }]) => {
+							 	const elements = injected.querySelectorAll(parsed, node);
+								if (callId)
+									injected.markTargetElements(new Set(elements), callId);
+								return elements;
+							}, {
+								parsed: parsedEdits,
+								callId
+							}
+						);
+						queryGroups.push({ handles: shadowHandles, parentNode: shadowRoot });
+					}
+
+					// Document Root Elements (not in CSR)
+					const rootHandles = await (scope as any)._evaluateHandleInUtility(
+						([injected, node, { parsed, callId }]) => {
+						 	const elements = injected.querySelectorAll(parsed, node);
+							if (callId)
+								injected.markTargetElements(new Set(elements), callId);
+							return elements;
+						}, {
+							parsed: parsedEdits,
+							callId
+						}
+					);
+					queryGroups.push({ handles: rootHandles, parentNode: scope });
+
+					// Querying and Sorting the elements by their backendNodeId
+					for (const { handles, parentNode } of queryGroups) {
+						const handlesAmount = await (await handles.getProperty(progress, "length")).jsonValue(progress);
+						for (var i = 0; i < handlesAmount; i++) {
+							let element;
+						  if (parentNode instanceof ElementHandle) {
+								element = await (parentNode as any)._evaluateHandleInUtility(
+									([injected, node, { i, handles: elems }]) => elems[i],
+									{ i, handles }
+								);
+							} else {
+								element = await parentNode.evaluateHandle(
+									(injected, { i, handles: elems }) => elems[i],
+									{ i, handles }
+								);
+							}
+
+							// For other Functions/Utilities
+							element.parentNode = parentNode;
+							const resolvedElement = await client.send("DOM.describeNode", { objectId: element._objectId, depth: -1 });
+							element.backendNodeId = resolvedElement.node.backendNodeId;
+							element.nodePosition = await this._findElementPositionInDomTree(element, describedScope.node, context, "");
+							element.nodePositionScopeIsDocument = describedScope.node.nodeName === "#document";
+							elements.push(element);
+						}
+					}
+				}
+			}
+
+			// A missing position means the DOM changed after describeNode. Retry with a fresh snapshot.
+			if (elements.some(element => element.nodePosition === null && element.nodePositionScopeIsDocument))
+				return [];
+
+			// Sorting elements by their nodePosition, which is a index to the Element in the DOM tree
+			const getParts = (pos) => (pos || '').split('.').filter(Boolean).map(Number);
+			elements.sort((a, b) => {
+				const partsA = getParts(a.nodePosition);
+				const partsB = getParts(b.nodePosition);
+
+				for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
+					const diff = (partsA[i] ?? -1) - (partsB[i] ?? -1);
+					if (diff !== 0) return diff;
+				}
+				return 0;
+			});
+
+			// Remove duplicates by backendNodeId, keeping the first occurrence
+			currentScopingElements = Array.from(
+				new Map(elements.map(e => [e.backendNodeId, e])).values()
+			);
+		}
+
+		return currentScopingElements;
+	`);
+
+	// -- _findElementPositionInDomTree Method --
+	frameSelectorsClass.addMethod({
+		name: "_findElementPositionInDomTree",
+		isAsync: true,
+		parameters: [
+			{ name: "element", type: "{ backendNodeId: number }" },
+			{ name: "queryingElement", type: "Protocol.DOM.Node" },
+			{ name: "context", type: "FrameExecutionContext" },
+			{ name: "currentIndex", type: "string" },
+		],
+	});
+	const findElementPositionInDomTreeMethod = frameSelectorsClass.getMethodOrThrow("_findElementPositionInDomTree");
+	findElementPositionInDomTreeMethod.setBodyText(`
+		// Get Element Position in DOM Tree by Indexing it via their children indexes, like a search tree index
+		// Check if backendNodeId matches, if so, return currentIndex
+		if (element.backendNodeId === queryingElement.backendNodeId)
+			return currentIndex;
+
+		// Iterating through children of queryingElement
+		for (const [childrenNodeIndex, child] of (queryingElement.children || []).entries()) {
+			// Further querying the child recursively and appending the children index to the currentIndex
+			const childIndex = await this._findElementPositionInDomTree(element, child, context, currentIndex + "." + childrenNodeIndex.toString());
+			if (childIndex !== null) return childIndex;
+		}
+
+		for (const shadowRoot of queryingElement.shadowRoots || []) {
+			// For CSRs, we dont have to append its index because patchright treats CSRs like they dont exist
+			if (shadowRoot.shadowRootType === "closed" && shadowRoot.backendNodeId && !shadowRoot.children) {
+				// Resolve the CDP client for the current context so closed shadow roots can be traversed safely.
+				const client = context.frame._page.delegate._sessionForFrame(context.frame)._client;
+				const describedShadowRoot = await client.send("DOM.describeNode", { backendNodeId: shadowRoot.backendNodeId, depth: -1, pierce: true });
+				if (describedShadowRoot && describedShadowRoot.node) {
+					const childIndex = await this._findElementPositionInDomTree(element, describedShadowRoot.node, context, currentIndex);
+					if (childIndex !== null) return childIndex;
+				}
+			}
+			// Traverse into shadow root children (open and closed) to properly position elements inside shadow DOMs
+			for (const [shadowChildIndex, shadowChild] of (shadowRoot.children || []).entries()) {
+				const childIndex = await this._findElementPositionInDomTree(element, shadowChild, context, currentIndex + "." + shadowChildIndex.toString());
+				if (childIndex !== null) return childIndex;
+			}
+		}
+		return null;
+	`);
+}
